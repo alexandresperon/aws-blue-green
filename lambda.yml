@@ -1,0 +1,218 @@
+Parameters:
+  Vpc:
+    Type: "AWS::EC2::VPC::Id"
+  Subnet1:
+    Type: "AWS::EC2::Subnet::Id"
+  Subnet2:
+    Type: "AWS::EC2::Subnet::Id"
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup::Id"
+  LoadBalancerListenerArn:
+    Type: String
+    AllowedPattern: ^arn:aws:elasticloadbalancing:(us(-gov)?|ap|ca|cn|eu|sa)-(central|(north|south)?(east|west)?)-\d::\d{12}:listener/.+
+    ConstraintDescription: Must be a valid ELB Listener ARN
+  LoadBalancerUrl:
+    Type: String
+Resources:
+  VerifyListenerStateQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 60
+      QueueName: verify-listener-state
+  PutLifecycleStateQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 15
+      QueueName: put-lifecycle-state
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AwsLambdaBlueGreenRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutLifecycleStatusPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - codedeploy:PutLifecycleEventHookExecutionStatus
+                  - codedeploy:CreateCloudFormationDeployment
+                  - elasticloadbalancing:DescribeListeners
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: "*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+  AfterAllowTrafficHookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lbd-after-allow-traffic-hook
+      Runtime: nodejs12.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Environment:
+        Variables:
+          QUEUE_URL: !Ref VerifyListenerStateQueue
+      Code:
+        ZipFile: |
+          const aws = require('aws-sdk');
+          const sqs = new aws.SQS();
+          exports.handler = async (event, context) => {
+            const messageParams = {
+              MessageAttributes: {
+                "DeploymentId": {
+                  DataType: "String",
+                  StringValue: event.DeploymentId
+                },
+                "LifecycleEventHookExecutionId": {
+                  DataType: "String",
+                  StringValue: event.LifecycleEventHookExecutionId
+                }
+              },
+              MessageBody: "new event",
+              QueueUrl: process.env.QUEUE_URL
+            };
+            return sqs.sendMessage(messageParams).promise();
+          };
+  VerifyListenerStateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lbd-verify-listener-state
+      Runtime: nodejs12.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Environment:
+        Variables:
+          ELB_LISTENER_ARN: !Ref LoadBalancerListenerArn
+          QUEUE_URL: !Ref PutLifecycleStateQueue
+      Code:
+        ZipFile: |
+          const aws = require('aws-sdk');
+          const sqs = new aws.SQS();
+          const elb = new aws.ELBv2();
+          exports.handler = async (event, context) => {
+            const attributes = event.Records[0].messageAttributes;
+            console.log(attributes);
+            const describeListenersParams = {
+              ListenerArns: [
+                process.env.ELB_LISTENER_ARN
+                ]
+            };
+            const listener =  await elb.describeListeners(describeListenersParams).promise();
+            console.log(listener);
+            const describeTargetHealthParams = {
+              TargetGroupArn: listener.Listeners[0].DefaultActions[0].TargetGroupArn
+            };
+            const targetHealth = await elb.describeTargetHealth(describeTargetHealthParams).promise();
+            console.log(targetHealth);
+            const state = targetHealth.TargetHealthDescriptions[0].TargetHealth.State;
+            if(state != 'initial') {
+              const messageParams = {
+                MessageAttributes: {
+                  "DeploymentId": {
+                    DataType: "String",
+                    StringValue: attributes.DeploymentId.stringValue
+                  },
+                  "LifecycleEventHookExecutionId": {
+                    DataType: "String",
+                    StringValue: attributes.LifecycleEventHookExecutionId.stringValue
+                  }
+                },
+                MessageBody: state,
+                QueueUrl: process.env.QUEUE_URL
+              };
+              return sqs.sendMessage(messageParams).promise();
+            }
+            return Promise.reject('Health status not ready yet');
+          };
+  VerifyListenerStateSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt VerifyListenerStateQueue.Arn
+      FunctionName: !GetAtt VerifyListenerStateLambda.Arn
+  PutLifecycleStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lbd-put-lifecycle-status
+      Runtime: nodejs12.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        SubnetIds:
+          - !Ref Subnet1
+          - !Ref Subnet2
+      Environment:
+        Variables:
+          NLB_URL: !Ref LoadBalancerUrl
+      Code:
+        ZipFile: |
+          const http = require('http')
+          const aws = require('aws-sdk');
+          const codedeploy = new aws.CodeDeploy();
+          exports.handler = async (event, context) => {
+              const attributes = event.Records[0].messageAttributes;
+              console.log(attributes);
+              const options = {
+                hostname: process.env.NLB_URL,
+                port: 5080,
+                method: 'GET'
+              };
+              console.log(options);
+              const resp = JSON.parse(await doRequest(options));
+              console.log(resp);
+              const params = {
+                deploymentId: attributes.DeploymentId.stringValue,
+                lifecycleEventHookExecutionId: attributes.LifecycleEventHookExecutionId.stringValue,
+                status: resp.status == 'OK' ? 'Succeeded' : 'Failed'
+              };
+              console.log(params);
+              return codedeploy.putLifecycleEventHookExecutionStatus(params).promise();
+          };
+
+          function doRequest(options) {
+            return new Promise ((resolve, reject) => {
+              let req = http.request(options);
+              let body = ''; 
+
+              req.on('response', res => {
+                res.on('data', chunk => body += chunk);
+                res.on('end', () => resolve(body));
+              });
+
+              req.on('error', err => {
+                reject(err);
+              });
+
+              req.end();
+            }); 
+          }
+  PutLifecycleStateSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt PutLifecycleStateQueue.Arn
+      FunctionName: !GetAtt PutLifecycleStatusLambda.Arn

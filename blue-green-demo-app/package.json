@@ -1,0 +1,11 @@
+{
+  "name": "blue-green-demo-app",
+  "version": "1.0.0",
+  "description": "blue green demo app",
+  "main": "app.js",
+  "author": "alexandresperon",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.17.1"
+  }
+}
